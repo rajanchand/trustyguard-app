@@ -22,7 +22,6 @@ serve(async (req) => {
     const { action, collection, database, query, data, filter, update, pipeline, options } = await req.json();
     const db = database || "zerotrustsecurity";
 
-    // Map actions to Data API endpoints
     const endpointMap: Record<string, string> = {
       find: "find",
       findOne: "findOne",
@@ -38,7 +37,6 @@ serve(async (req) => {
     const endpoint = endpointMap[action];
     if (!endpoint) throw new Error(`Unknown action: ${action}`);
 
-    // Build the request body per MongoDB Data API spec
     const body: Record<string, unknown> = {
       dataSource: "zerotrustsecurity",
       database: db,
