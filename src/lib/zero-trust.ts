@@ -4,6 +4,11 @@ export interface SignalData {
   ip: string;
   country: string;
   city: string;
+  region: string;
+  isp: string;
+  timezone: string;
+  lat: number;
+  lon: number;
   userAgent: string;
   os: string;
   browser: string;
@@ -27,15 +32,46 @@ export interface PolicyResult {
   signals: SignalData;
 }
 
-const SIMULATED_IPS = [
-  { ip: '192.168.1.100', country: 'United States', city: 'New York' },
-  { ip: '10.0.0.55', country: 'United States', city: 'San Francisco' },
-  { ip: '203.0.113.42', country: 'Germany', city: 'Berlin' },
-  { ip: '198.51.100.7', country: 'Russia', city: 'Moscow' },
-];
+export interface RealIPInfo {
+  ip: string;
+  country: string;
+  city: string;
+  region: string;
+  isp: string;
+  timezone: string;
+  lat: number;
+  lon: number;
+}
 
-export function getSimulatedIP() {
-  return SIMULATED_IPS[Math.floor(Math.random() * SIMULATED_IPS.length)];
+let cachedIPInfo: RealIPInfo | null = null;
+
+export async function fetchRealIP(): Promise<RealIPInfo> {
+  if (cachedIPInfo) return cachedIPInfo;
+  try {
+    const res = await fetch('http://ip-api.com/json/?fields=query,country,city,regionName,isp,timezone,lat,lon');
+    if (!res.ok) throw new Error('IP API failed');
+    const data = await res.json();
+    cachedIPInfo = {
+      ip: data.query || '0.0.0.0',
+      country: data.country || 'Unknown',
+      city: data.city || 'Unknown',
+      region: data.regionName || '',
+      isp: data.isp || 'Unknown',
+      timezone: data.timezone || '',
+      lat: data.lat || 0,
+      lon: data.lon || 0,
+    };
+    return cachedIPInfo;
+  } catch {
+    // Fallback
+    cachedIPInfo = { ip: '0.0.0.0', country: 'Unknown', city: 'Unknown', region: '', isp: 'Unknown', timezone: '', lat: 0, lon: 0 };
+    return cachedIPInfo;
+  }
+}
+
+// Synchronous getter after first fetch
+export function getCachedIP(): RealIPInfo {
+  return cachedIPInfo || { ip: '0.0.0.0', country: 'Unknown', city: 'Unknown', region: '', isp: 'Unknown', timezone: '', lat: 0, lon: 0 };
 }
 
 export function getDeviceFingerprint(): string {
@@ -75,13 +111,17 @@ export function getSimulatedPosture(): Device['posture'] {
   };
 }
 
-export function collectSignals(failedAttempts: number, deviceApproved: boolean, posture?: Device['posture']): SignalData {
-  const ipInfo = getSimulatedIP();
+export function collectSignals(ipInfo: RealIPInfo, failedAttempts: number, deviceApproved: boolean, posture?: Device['posture']): SignalData {
   const p = posture || getSimulatedPosture();
   return {
     ip: ipInfo.ip,
     country: ipInfo.country,
     city: ipInfo.city,
+    region: ipInfo.region,
+    isp: ipInfo.isp,
+    timezone: ipInfo.timezone,
+    lat: ipInfo.lat,
+    lon: ipInfo.lon,
     userAgent: navigator.userAgent,
     os: detectOS(),
     browser: detectBrowser(),
@@ -95,24 +135,24 @@ export function collectSignals(failedAttempts: number, deviceApproved: boolean, 
 export function computeRiskScore(signals: SignalData): number {
   let score = 0;
 
-  // High-risk countries
-  if (['Russia', 'China', 'North Korea'].includes(signals.country)) score += 30;
-  
-  // Failed attempts
+  const HIGH_RISK_COUNTRIES = ['Russia', 'China', 'North Korea', 'Iran', 'Syria'];
+  if (HIGH_RISK_COUNTRIES.includes(signals.country)) score += 30;
+
   score += Math.min(signals.failedAttempts * 10, 30);
 
-  // Device not approved
   if (!signals.deviceApproved) score += 15;
 
-  // Device posture
   if (!signals.posture.hasUpdatedOS) score += 8;
   if (!signals.posture.hasAV) score += 10;
   if (!signals.posture.diskEncrypted) score += 7;
   if (!signals.posture.screenLockEnabled) score += 5;
 
-  // Off-hours login (before 6am or after 10pm)
   const hour = new Date(signals.loginTime).getHours();
   if (hour < 6 || hour > 22) score += 10;
+
+  // VPN/proxy detection (simple heuristic based on ISP names)
+  const suspiciousISP = ['tor', 'vpn', 'proxy', 'hosting'].some(k => signals.isp.toLowerCase().includes(k));
+  if (suspiciousISP) score += 15;
 
   return Math.min(score, 100);
 }
@@ -123,8 +163,8 @@ export function evaluatePolicy(riskScore: number): PolicyResult['decision'] {
   return 'block';
 }
 
-export function runZeroTrustCheck(failedAttempts: number, deviceApproved: boolean, posture?: Device['posture']): PolicyResult {
-  const signals = collectSignals(failedAttempts, deviceApproved, posture);
+export function runZeroTrustCheck(ipInfo: RealIPInfo, failedAttempts: number, deviceApproved: boolean, posture?: Device['posture']): PolicyResult {
+  const signals = collectSignals(ipInfo, failedAttempts, deviceApproved, posture);
   const riskScore = computeRiskScore(signals);
   const decision = evaluatePolicy(riskScore);
   
@@ -134,7 +174,10 @@ export function runZeroTrustCheck(failedAttempts: number, deviceApproved: boolea
   if (signals.failedAttempts > 2) reasons.push('Multiple failed login attempts');
   if (!signals.posture.hasAV) reasons.push('No antivirus detected');
   if (!signals.posture.diskEncrypted) reasons.push('Disk not encrypted');
-  if (['Russia', 'China', 'North Korea'].includes(signals.country)) reasons.push('High-risk location');
+  const HIGH_RISK_COUNTRIES = ['Russia', 'China', 'North Korea', 'Iran', 'Syria'];
+  if (HIGH_RISK_COUNTRIES.includes(signals.country)) reasons.push('High-risk location');
+  const suspiciousISP = ['tor', 'vpn', 'proxy', 'hosting'].some(k => signals.isp.toLowerCase().includes(k));
+  if (suspiciousISP) reasons.push('Suspicious ISP/VPN detected');
 
   return { decision, riskScore, reasons, signals };
 }

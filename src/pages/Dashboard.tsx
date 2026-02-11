@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { Shield, Monitor, MapPin, Clock, Cpu } from 'lucide-react';
+import { Shield, Monitor, MapPin, Clock, Cpu, Globe, Wifi } from 'lucide-react';
 import Navbar from '@/components/Navbar';
 import RiskScoreGauge from '@/components/RiskScoreGauge';
 import ZeroTrustWorkflow from '@/components/ZeroTrustWorkflow';
@@ -7,7 +7,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 
 export default function Dashboard() {
-  const { user, currentDevice, lastPolicyResult, requestDeviceApproval } = useAuth();
+  const { user, currentDevice, lastPolicyResult, requestDeviceApproval, ipInfo } = useAuth();
   if (!user) return null;
 
   const decisionColor = lastPolicyResult?.decision === 'allow' ? 'text-success' : lastPolicyResult?.decision === 'step_up_mfa' ? 'text-warning' : 'text-destructive';
@@ -56,15 +56,32 @@ export default function Dashboard() {
                   {lastPolicyResult.decision.replace('_', ' ')}
                 </div>
                 <div className="text-xs text-muted-foreground mt-2 space-y-1">
-                  <div className="flex items-center gap-2"><MapPin className="h-3 w-3" />{lastPolicyResult.signals.city}, {lastPolicyResult.signals.country}</div>
+                  <div className="flex items-center gap-2"><MapPin className="h-3 w-3" />{lastPolicyResult.signals.city}, {lastPolicyResult.signals.region}, {lastPolicyResult.signals.country}</div>
                   <div className="flex items-center gap-2"><Monitor className="h-3 w-3" />{lastPolicyResult.signals.browser} / {lastPolicyResult.signals.os}</div>
                   <div className="flex items-center gap-2"><Clock className="h-3 w-3" />{new Date(lastPolicyResult.signals.loginTime).toLocaleString()}</div>
                   <div className="flex items-center gap-2"><Shield className="h-3 w-3" />IP: {lastPolicyResult.signals.ip}</div>
+                  <div className="flex items-center gap-2"><Wifi className="h-3 w-3" />ISP: {lastPolicyResult.signals.isp}</div>
+                  <div className="flex items-center gap-2"><Globe className="h-3 w-3" />TZ: {lastPolicyResult.signals.timezone} | Lat: {lastPolicyResult.signals.lat?.toFixed(2)}, Lon: {lastPolicyResult.signals.lon?.toFixed(2)}</div>
                 </div>
               </div>
             )}
           </motion.div>
         </div>
+
+        {/* Real IP Info */}
+        {ipInfo && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.25 }} className="mt-6 rounded-lg border border-primary/20 bg-card p-6">
+            <h3 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wider flex items-center gap-2">
+              <Globe className="h-4 w-4 text-primary" /> Your Real Location (Live)
+            </h3>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
+              <div className="flex justify-between sm:flex-col"><span className="text-muted-foreground">IP Address</span><span className="font-mono text-primary">{ipInfo.ip}</span></div>
+              <div className="flex justify-between sm:flex-col"><span className="text-muted-foreground">Location</span><span className="font-mono text-foreground">{ipInfo.city}, {ipInfo.region}, {ipInfo.country}</span></div>
+              <div className="flex justify-between sm:flex-col"><span className="text-muted-foreground">ISP</span><span className="font-mono text-foreground">{ipInfo.isp}</span></div>
+              <div className="flex justify-between sm:flex-col"><span className="text-muted-foreground">Timezone</span><span className="font-mono text-foreground">{ipInfo.timezone}</span></div>
+            </div>
+          </motion.div>
+        )}
 
         {/* Zero Trust Workflow */}
         <div className="mt-6">

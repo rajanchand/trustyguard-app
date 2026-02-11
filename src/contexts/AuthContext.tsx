@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { DemoUser, Role, getUsers, setUsers, addAuditLog, getDevices, setDevices, getOTPs, setOTPs, initDemoData, Device, OTPRecord } from '@/lib/demo-data';
-import { runZeroTrustCheck, PolicyResult, getDeviceFingerprint, detectOS, detectBrowser, getSimulatedIP, getSimulatedPosture } from '@/lib/zero-trust';
+import { DemoUser, Role, getUsers, setUsers, addAuditLog, getDevices, setDevices, getOTPs, setOTPs, initDemoData, Device } from '@/lib/demo-data';
+import { runZeroTrustCheck, PolicyResult, getDeviceFingerprint, detectOS, detectBrowser, fetchRealIP, getCachedIP, getSimulatedPosture, RealIPInfo } from '@/lib/zero-trust';
 
 interface AuthState {
   user: DemoUser | null;
@@ -8,6 +8,7 @@ interface AuthState {
   pendingOTP: { userId: string; type: 'registration' | 'login' } | null;
   lastPolicyResult: PolicyResult | null;
   currentDevice: Device | null;
+  ipInfo: RealIPInfo | null;
 }
 
 interface AuthContextType extends AuthState {
@@ -18,6 +19,8 @@ interface AuthContextType extends AuthState {
   logout: () => void;
   hasRole: (requiredRoles: Role[]) => boolean;
   getAllUsers: () => DemoUser[];
+  addUser: (data: { fullName: string; email: string; mobile: string; password: string; role: Role }) => { success: boolean; error?: string };
+  updateUser: (userId: string, data: Partial<Pick<DemoUser, 'fullName' | 'email' | 'mobile' | 'role' | 'status'>>) => void;
   updateUserRole: (userId: string, role: Role) => void;
   toggleUserStatus: (userId: string) => void;
   deleteUser: (userId: string) => void;
@@ -36,10 +39,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     pendingOTP: null,
     lastPolicyResult: null,
     currentDevice: null,
+    ipInfo: null,
   });
 
   useEffect(() => {
     initDemoData();
+    // Fetch real IP on mount
+    fetchRealIP().then(info => {
+      setState(s => ({ ...s, ipInfo: info }));
+    });
     const saved = localStorage.getItem('zt_session');
     if (saved) {
       const session = JSON.parse(saved);
@@ -53,6 +61,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
   }, []);
+
+  const getIP = useCallback(() => state.ipInfo || getCachedIP(), [state.ipInfo]);
 
   const generateOTP = useCallback((): string => {
     return Math.floor(100000 + Math.random() * 900000).toString();
@@ -81,22 +91,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     otps.push({ userId: newUser.id, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: 'registration', attempts: 0 });
     setOTPs(otps);
 
-    const ipInfo = getSimulatedIP();
-    addAuditLog({ userId: newUser.id, userEmail: newUser.email, action: 'REGISTER', details: 'New user registration', ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'success' });
-    addAuditLog({ userId: newUser.id, userEmail: newUser.email, action: 'OTP_SENT', details: `Registration OTP sent: ${otp}`, ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'success' });
+    const ip = getIP();
+    addAuditLog({ userId: newUser.id, userEmail: newUser.email, action: 'REGISTER', details: 'New user registration', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    addAuditLog({ userId: newUser.id, userEmail: newUser.email, action: 'OTP_SENT', details: `Registration OTP sent: ${otp}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
 
     setState(s => ({ ...s, pendingOTP: { userId: newUser.id, type: 'registration' } }));
     console.log(`📧 OTP for ${data.email}: ${otp}`);
     return { success: true, otp };
-  }, [generateOTP]);
+  }, [generateOTP, getIP]);
 
   const login = useCallback((email: string, password: string) => {
     const users = getUsers();
     const user = users.find(u => u.email === email);
     if (!user) return { success: false, error: 'Invalid credentials', requiresOTP: false };
     if (user.password !== password) {
-      const ipInfo = getSimulatedIP();
-      addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_FAIL', details: 'Invalid password', ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'failure' });
+      const ip = getIP();
+      addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_FAIL', details: 'Invalid password', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'failure' });
       return { success: false, error: 'Invalid credentials', requiresOTP: false };
     }
     if (user.status === 'disabled') return { success: false, error: 'Account disabled', requiresOTP: false };
@@ -107,13 +117,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     otps.push({ userId: user.id, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: 'login', attempts: 0 });
     setOTPs(otps);
 
-    const ipInfo = getSimulatedIP();
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'OTP_SENT', details: `Login OTP sent: ${otp}`, ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'success' });
+    const ip = getIP();
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'OTP_SENT', details: `Login OTP sent: ${otp}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
 
     setState(s => ({ ...s, pendingOTP: { userId: user.id, type: 'login' } }));
     console.log(`📧 OTP for ${email}: ${otp}`);
     return { success: true, requiresOTP: true, otp };
-  }, [generateOTP]);
+  }, [generateOTP, getIP]);
 
   const verifyOTP = useCallback((code: string) => {
     if (!state.pendingOTP) return { success: false, error: 'No pending OTP' };
@@ -135,8 +145,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (otp.code !== code) {
       otp.attempts++;
       setOTPs(otps);
-      const ipInfo = getSimulatedIP();
-      addAuditLog({ userId: otp.userId, userEmail: '', action: 'OTP_FAIL', details: 'Invalid OTP entered', ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'failure' });
+      const ip = getIP();
+      addAuditLog({ userId: otp.userId, userEmail: '', action: 'OTP_FAIL', details: 'Invalid OTP entered', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'failure' });
       return { success: false, error: 'Invalid OTP' };
     }
 
@@ -172,19 +182,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setDevices(devices);
     }
 
-    // Zero trust check
-    const failedAttempts = 0;
-    const policy = runZeroTrustCheck(failedAttempts, device.approved, device.posture);
+    // Zero trust check with REAL IP
+    const ip = getIP();
+    const policy = runZeroTrustCheck(ip, 0, device.approved, device.posture);
 
-    const ipInfo = getSimulatedIP();
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'OTP_VERIFIED', details: 'OTP verified successfully', ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'success', riskScore: policy.riskScore });
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'POLICY_DECISION', details: `Decision: ${policy.decision} | Risk: ${policy.riskScore} | Reasons: ${policy.reasons.join(', ') || 'None'}`, ip: policy.signals.ip, location: `${policy.signals.city}, ${policy.signals.country}`, outcome: policy.decision === 'block' ? 'blocked' : 'success', riskScore: policy.riskScore });
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_SUCCESS', details: `Login from ${device.browser} on ${device.os}`, ip: policy.signals.ip, location: `${policy.signals.city}, ${policy.signals.country}`, outcome: 'success', riskScore: policy.riskScore });
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'OTP_VERIFIED', details: 'OTP verified successfully', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success', riskScore: policy.riskScore });
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'POLICY_DECISION', details: `Decision: ${policy.decision} | Risk: ${policy.riskScore} | Reasons: ${policy.reasons.join(', ') || 'None'}`, ip: ip.ip, location: `${policy.signals.city}, ${policy.signals.country}`, outcome: policy.decision === 'block' ? 'blocked' : 'success', riskScore: policy.riskScore });
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_SUCCESS', details: `Login from ${device.browser} on ${device.os}`, ip: ip.ip, location: `${policy.signals.city}, ${policy.signals.country}`, outcome: 'success', riskScore: policy.riskScore });
 
     localStorage.setItem('zt_session', JSON.stringify({ userId: user.id, lastPolicy: policy }));
-    setState({ user, isAuthenticated: true, pendingOTP: null, lastPolicyResult: policy, currentDevice: device });
+    setState(s => ({ ...s, user, isAuthenticated: true, pendingOTP: null, lastPolicyResult: policy, currentDevice: device }));
     return { success: true };
-  }, [state.pendingOTP]);
+  }, [state.pendingOTP, getIP]);
 
   const resendOTP = useCallback(() => {
     if (!state.pendingOTP) return { success: false };
@@ -199,12 +208,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(() => {
     if (state.user) {
-      const ipInfo = getSimulatedIP();
-      addAuditLog({ userId: state.user.id, userEmail: state.user.email, action: 'LOGOUT', details: 'User logged out', ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'success' });
+      const ip = getIP();
+      addAuditLog({ userId: state.user.id, userEmail: state.user.email, action: 'LOGOUT', details: 'User logged out', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
     }
     localStorage.removeItem('zt_session');
-    setState({ user: null, isAuthenticated: false, pendingOTP: null, lastPolicyResult: null, currentDevice: null });
-  }, [state.user]);
+    setState(s => ({ ...s, user: null, isAuthenticated: false, pendingOTP: null, lastPolicyResult: null, currentDevice: null }));
+  }, [state.user, getIP]);
 
   const hasRole = useCallback((requiredRoles: Role[]) => {
     if (!state.user) return false;
@@ -213,6 +222,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [state.user]);
 
   const getAllUsers = useCallback(() => getUsers(), []);
+
+  const addUser = useCallback((data: { fullName: string; email: string; mobile: string; password: string; role: Role }) => {
+    const users = getUsers();
+    if (users.find(u => u.email === data.email)) return { success: false, error: 'Email already exists' };
+    const newUser: DemoUser = {
+      id: 'u_' + Date.now(),
+      fullName: data.fullName,
+      email: data.email,
+      mobile: data.mobile,
+      password: data.password,
+      role: data.role,
+      status: 'active',
+      createdAt: new Date().toISOString(),
+    };
+    users.push(newUser);
+    setUsers(users);
+    const ip = getIP();
+    addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_CREATED', details: `SuperAdmin created user: ${data.email} with role ${data.role}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    return { success: true };
+  }, [state.user, getIP]);
+
+  const updateUser = useCallback((userId: string, data: Partial<Pick<DemoUser, 'fullName' | 'email' | 'mobile' | 'role' | 'status'>>) => {
+    const users = getUsers();
+    const user = users.find(u => u.id === userId);
+    if (user) {
+      Object.assign(user, data);
+      setUsers(users);
+      const ip = getIP();
+      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_UPDATED', details: `SuperAdmin updated user: ${user.email}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    }
+  }, [state.user, getIP]);
   
   const updateUserRole = useCallback((userId: string, role: Role) => {
     const users = getUsers();
@@ -220,8 +260,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (user) {
       user.role = role;
       setUsers(users);
+      const ip = getIP();
+      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'ROLE_CHANGED', details: `Role changed for ${user.email} to ${role}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
     }
-  }, []);
+  }, [state.user, getIP]);
 
   const toggleUserStatus = useCallback((userId: string) => {
     const users = getUsers();
@@ -229,13 +271,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (user) {
       user.status = user.status === 'active' ? 'disabled' : 'active';
       setUsers(users);
+      const ip = getIP();
+      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_STATUS_CHANGED', details: `User ${user.email} ${user.status}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
     }
-  }, []);
+  }, [state.user, getIP]);
 
   const deleteUser = useCallback((userId: string) => {
-    const users = getUsers().filter(u => u.id !== userId);
-    setUsers(users);
-  }, []);
+    const users = getUsers();
+    const target = users.find(u => u.id === userId);
+    const filtered = users.filter(u => u.id !== userId);
+    setUsers(filtered);
+    const ip = getIP();
+    addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_DELETED', details: `SuperAdmin deleted user: ${target?.email || userId}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+  }, [state.user, getIP]);
 
   const approveDevice = useCallback((deviceId: string) => {
     const devices = getDevices();
@@ -244,26 +292,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       device.approved = true;
       device.approvedBy = state.user?.id;
       setDevices(devices);
+      const ip = getIP();
+      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'DEVICE_APPROVED', details: `Device ${deviceId} approved`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
     }
-  }, [state.user]);
+  }, [state.user, getIP]);
 
   const denyDevice = useCallback((deviceId: string) => {
     const devices = getDevices().filter(d => d.id !== deviceId);
     setDevices(devices);
-  }, []);
+    const ip = getIP();
+    addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'DEVICE_DENIED', details: `Device ${deviceId} denied and removed`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+  }, [state.user, getIP]);
 
   const getAllDevices = useCallback(() => getDevices(), []);
 
   const requestDeviceApproval = useCallback(() => {
     if (!state.user || !state.currentDevice) return;
-    const ipInfo = getSimulatedIP();
-    addAuditLog({ userId: state.user.id, userEmail: state.user.email, action: 'DEVICE_APPROVAL_REQUEST', details: `Device approval requested: ${state.currentDevice.browser} on ${state.currentDevice.os}`, ip: ipInfo.ip, location: `${ipInfo.city}, ${ipInfo.country}`, outcome: 'success' });
-  }, [state.user, state.currentDevice]);
+    const ip = getIP();
+    addAuditLog({ userId: state.user.id, userEmail: state.user.email, action: 'DEVICE_APPROVAL_REQUEST', details: `Device approval requested: ${state.currentDevice.browser} on ${state.currentDevice.os}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+  }, [state.user, state.currentDevice, getIP]);
 
   return (
     <AuthContext.Provider value={{
       ...state, register, login, verifyOTP, resendOTP, logout, hasRole,
-      getAllUsers, updateUserRole, toggleUserStatus, deleteUser,
+      getAllUsers, addUser, updateUser, updateUserRole, toggleUserStatus, deleteUser,
       approveDevice, denyDevice, getAllDevices, requestDeviceApproval,
     }}>
       {children}
