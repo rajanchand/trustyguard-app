@@ -1,11 +1,11 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { DemoUser, Role, getUsers, setUsers, addAuditLog, getDevices, setDevices, getOTPs, setOTPs, initDemoData, Device } from '@/lib/demo-data';
+import { DemoUser, Role, getUsers, setUsers, addAuditLog, getDevices, setDevices, getOTPs, setOTPs, initDemoData, Device, checkRateLimit, recordRateAttempt } from '@/lib/demo-data';
 import { runZeroTrustCheck, PolicyResult, getDeviceFingerprint, detectOS, detectBrowser, fetchRealIP, getCachedIP, getSimulatedPosture, RealIPInfo } from '@/lib/zero-trust';
 
 interface AuthState {
   user: DemoUser | null;
   isAuthenticated: boolean;
-  pendingOTP: { userId: string; type: 'registration' | 'login' } | null;
+  pendingOTP: { userId: string; type: 'registration' | 'login'; email: string; mobile: string } | null;
   lastPolicyResult: PolicyResult | null;
   currentDevice: Device | null;
   ipInfo: RealIPInfo | null;
@@ -13,7 +13,8 @@ interface AuthState {
 
 interface AuthContextType extends AuthState {
   register: (data: { fullName: string; email: string; mobile: string; password: string }) => { success: boolean; error?: string; otp?: string };
-  login: (email: string, password: string) => { success: boolean; error?: string; otp?: string; requiresOTP: boolean };
+  login: (email: string, password: string) => { success: boolean; error?: string; requiresOTP: boolean; needsChannel?: boolean };
+  sendLoginOTP: (channel: 'email' | 'mobile') => { success: boolean; otp?: string };
   verifyOTP: (code: string) => { success: boolean; error?: string };
   resendOTP: () => { success: boolean; otp?: string };
   logout: () => void;
@@ -28,6 +29,7 @@ interface AuthContextType extends AuthState {
   denyDevice: (deviceId: string) => void;
   getAllDevices: () => Device[];
   requestDeviceApproval: () => void;
+  unlockUser: (userId: string) => void;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -44,16 +46,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     initDemoData();
-    // Fetch real IP on mount
-    fetchRealIP().then(info => {
-      setState(s => ({ ...s, ipInfo: info }));
-    });
+    fetchRealIP().then(info => setState(s => ({ ...s, ipInfo: info })));
     const saved = localStorage.getItem('zt_session');
     if (saved) {
       const session = JSON.parse(saved);
       const users = getUsers();
       const user = users.find(u => u.id === session.userId);
-      if (user && user.status === 'active') {
+      if (user && (user.status === 'active')) {
         const fp = getDeviceFingerprint();
         const devices = getDevices();
         const device = devices.find(d => d.userId === user.id && d.fingerprint === fp);
@@ -64,90 +63,115 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const getIP = useCallback(() => state.ipInfo || getCachedIP(), [state.ipInfo]);
 
-  const generateOTP = useCallback((): string => {
-    return Math.floor(100000 + Math.random() * 900000).toString();
-  }, []);
+  const generateOTP = useCallback((): string => Math.floor(100000 + Math.random() * 900000).toString(), []);
 
   const register = useCallback((data: { fullName: string; email: string; mobile: string; password: string }) => {
     const users = getUsers();
-    if (users.find(u => u.email === data.email)) {
-      return { success: false, error: 'Email already registered' };
-    }
+    if (users.find(u => u.email === data.email)) return { success: false, error: 'Email already registered' };
     const newUser: DemoUser = {
-      id: 'u_' + Date.now(),
-      fullName: data.fullName,
-      email: data.email,
-      mobile: data.mobile,
-      password: data.password,
-      role: 'USER',
-      status: 'pending_verification',
-      createdAt: new Date().toISOString(),
+      id: 'u_' + Date.now(), fullName: data.fullName, email: data.email, mobile: data.mobile,
+      password: data.password, role: 'USER', status: 'pending_verification', createdAt: new Date().toISOString(), failedLoginAttempts: 0,
     };
     users.push(newUser);
     setUsers(users);
-
     const otp = generateOTP();
     const otps = getOTPs();
-    otps.push({ userId: newUser.id, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: 'registration', attempts: 0 });
+    otps.push({ userId: newUser.id, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: 'registration', channel: 'both', attempts: 0 });
     setOTPs(otps);
-
     const ip = getIP();
     addAuditLog({ userId: newUser.id, userEmail: newUser.email, action: 'REGISTER', details: 'New user registration', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
-    addAuditLog({ userId: newUser.id, userEmail: newUser.email, action: 'OTP_SENT', details: `Registration OTP sent: ${otp}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
-
-    setState(s => ({ ...s, pendingOTP: { userId: newUser.id, type: 'registration' } }));
+    addAuditLog({ userId: newUser.id, userEmail: newUser.email, action: 'OTP_SENT', details: `Registration OTP sent to email & mobile: ${otp}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    setState(s => ({ ...s, pendingOTP: { userId: newUser.id, type: 'registration', email: newUser.email, mobile: newUser.mobile } }));
     console.log(`📧 OTP for ${data.email}: ${otp}`);
+    console.log(`📱 SMS OTP for ${data.mobile}: ${otp}`);
     return { success: true, otp };
   }, [generateOTP, getIP]);
 
   const login = useCallback((email: string, password: string) => {
+    // Rate limit check
+    if (!checkRateLimit(`login_${email}`, 10, 60000)) {
+      return { success: false, error: 'Too many login attempts. Wait 1 minute.', requiresOTP: false };
+    }
+    recordRateAttempt(`login_${email}`);
+
     const users = getUsers();
     const user = users.find(u => u.email === email);
     if (!user) return { success: false, error: 'Invalid credentials', requiresOTP: false };
-    if (user.password !== password) {
-      const ip = getIP();
-      addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_FAIL', details: 'Invalid password', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'failure' });
-      return { success: false, error: 'Invalid credentials', requiresOTP: false };
-    }
-    if (user.status === 'disabled') return { success: false, error: 'Account disabled', requiresOTP: false };
-    if (user.status === 'pending_verification') return { success: false, error: 'Account not verified', requiresOTP: false };
 
+    // Check account lock
+    if (user.status === 'locked') {
+      if (user.lockedUntil && Date.now() < user.lockedUntil) {
+        const mins = Math.ceil((user.lockedUntil - Date.now()) / 60000);
+        return { success: false, error: `Account locked. Try again in ${mins} minute(s).`, requiresOTP: false };
+      }
+      // Auto-unlock after lockout period
+      user.status = 'active';
+      user.failedLoginAttempts = 0;
+      user.lockedUntil = undefined;
+      setUsers(users);
+    }
+
+    if (user.password !== password) {
+      user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
+      const ip = getIP();
+      addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_FAIL', details: `Invalid password (attempt ${user.failedLoginAttempts}/5)`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'failure' });
+      
+      if (user.failedLoginAttempts >= 5) {
+        user.status = 'locked';
+        user.lockedUntil = Date.now() + 15 * 60 * 1000; // 15min lock
+        setUsers(users);
+        addAuditLog({ userId: user.id, userEmail: user.email, action: 'ACCOUNT_LOCKED', details: 'Account locked after 5 failed attempts', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'blocked' });
+        return { success: false, error: 'Account locked after 5 failed attempts. Try again in 15 minutes.', requiresOTP: false };
+      }
+      setUsers(users);
+      return { success: false, error: `Invalid credentials (${5 - user.failedLoginAttempts} attempts remaining)`, requiresOTP: false };
+    }
+
+    if (user.status === 'disabled') return { success: false, error: 'Account disabled by administrator', requiresOTP: false };
+    if (user.status === 'pending_verification') return { success: false, error: 'Account not verified. Complete OTP verification first.', requiresOTP: false };
+
+    // Reset failed attempts on success
+    user.failedLoginAttempts = 0;
+    setUsers(users);
+
+    // Don't generate OTP yet — let user choose channel
+    setState(s => ({ ...s, pendingOTP: { userId: user.id, type: 'login', email: user.email, mobile: user.mobile } }));
+    return { success: true, requiresOTP: true, needsChannel: true };
+  }, [getIP]);
+
+  const sendLoginOTP = useCallback((channel: 'email' | 'mobile') => {
+    if (!state.pendingOTP) return { success: false };
     const otp = generateOTP();
     const otps = getOTPs();
-    otps.push({ userId: user.id, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: 'login', attempts: 0 });
-    setOTPs(otps);
-
+    // Remove old OTPs for this user
+    const filtered = otps.filter(o => !(o.userId === state.pendingOTP!.userId && o.type === 'login'));
+    filtered.push({ userId: state.pendingOTP.userId, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: 'login', channel, attempts: 0 });
+    setOTPs(filtered);
     const ip = getIP();
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'OTP_SENT', details: `Login OTP sent: ${otp}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
-
-    setState(s => ({ ...s, pendingOTP: { userId: user.id, type: 'login' } }));
-    console.log(`📧 OTP for ${email}: ${otp}`);
-    return { success: true, requiresOTP: true, otp };
-  }, [generateOTP, getIP]);
+    const dest = channel === 'email' ? state.pendingOTP.email : state.pendingOTP.mobile;
+    addAuditLog({ userId: state.pendingOTP.userId, userEmail: state.pendingOTP.email, action: 'OTP_SENT', details: `Login OTP sent via ${channel} to ${dest}: ${otp}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    if (channel === 'email') {
+      console.log(`📧 Email OTP for ${state.pendingOTP.email}: ${otp}`);
+    } else {
+      console.log(`📱 SMS OTP for ${state.pendingOTP.mobile}: ${otp}`);
+    }
+    return { success: true, otp };
+  }, [state.pendingOTP, generateOTP, getIP]);
 
   const verifyOTP = useCallback((code: string) => {
     if (!state.pendingOTP) return { success: false, error: 'No pending OTP' };
     const otps = getOTPs();
     const idx = otps.findIndex(o => o.userId === state.pendingOTP!.userId && o.type === state.pendingOTP!.type);
-    if (idx === -1) return { success: false, error: 'OTP expired' };
+    if (idx === -1) return { success: false, error: 'OTP expired or not sent. Please request a new one.' };
     const otp = otps[idx];
-    
-    if (otp.attempts >= 5) {
-      otps.splice(idx, 1);
-      setOTPs(otps);
-      return { success: false, error: 'Too many attempts. Request a new OTP.' };
-    }
-    if (Date.now() > otp.expiresAt) {
-      otps.splice(idx, 1);
-      setOTPs(otps);
-      return { success: false, error: 'OTP expired' };
-    }
+    if (otp.attempts >= 5) { otps.splice(idx, 1); setOTPs(otps); return { success: false, error: 'Too many attempts. Request a new OTP.' }; }
+    if (Date.now() > otp.expiresAt) { otps.splice(idx, 1); setOTPs(otps); return { success: false, error: 'OTP expired. Request a new one.' }; }
     if (otp.code !== code) {
       otp.attempts++;
       setOTPs(otps);
       const ip = getIP();
-      addAuditLog({ userId: otp.userId, userEmail: '', action: 'OTP_FAIL', details: 'Invalid OTP entered', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'failure' });
-      return { success: false, error: 'Invalid OTP' };
+      addAuditLog({ userId: otp.userId, userEmail: state.pendingOTP.email, action: 'OTP_FAIL', details: `Invalid OTP (attempt ${otp.attempts}/5)`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'failure' });
+      return { success: false, error: `Invalid OTP (${5 - otp.attempts} attempts remaining)` };
     }
 
     otps.splice(idx, 1);
@@ -157,38 +181,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const user = users.find(u => u.id === state.pendingOTP!.userId);
     if (!user) return { success: false, error: 'User not found' };
 
-    if (state.pendingOTP.type === 'registration') {
-      user.status = 'active';
-      setUsers(users);
-    }
+    if (state.pendingOTP.type === 'registration') { user.status = 'active'; setUsers(users); }
 
-    // Device handling
     const fp = getDeviceFingerprint();
     const devices = getDevices();
     let device = devices.find(d => d.userId === user.id && d.fingerprint === fp);
     if (!device) {
       device = {
-        id: 'dev_' + Date.now(),
-        userId: user.id,
-        userAgent: navigator.userAgent,
-        os: detectOS(),
-        browser: detectBrowser(),
-        fingerprint: fp,
-        approved: false,
-        requestedAt: new Date().toISOString(),
-        posture: getSimulatedPosture(),
+        id: 'dev_' + Date.now(), userId: user.id, userAgent: navigator.userAgent,
+        os: detectOS(), browser: detectBrowser(), fingerprint: fp,
+        approved: false, requestedAt: new Date().toISOString(), posture: getSimulatedPosture(),
       };
       devices.push(device);
       setDevices(devices);
+      const ip = getIP();
+      addAuditLog({ userId: user.id, userEmail: user.email, action: 'NEW_DEVICE', details: `New device detected: ${device.browser} on ${device.os}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
     }
 
-    // Zero trust check with REAL IP
     const ip = getIP();
-    const policy = runZeroTrustCheck(ip, 0, device.approved, device.posture);
+    const policy = runZeroTrustCheck(ip, user.failedLoginAttempts || 0, device.approved, device.posture);
 
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'OTP_VERIFIED', details: 'OTP verified successfully', ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success', riskScore: policy.riskScore });
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'POLICY_DECISION', details: `Decision: ${policy.decision} | Risk: ${policy.riskScore} | Reasons: ${policy.reasons.join(', ') || 'None'}`, ip: ip.ip, location: `${policy.signals.city}, ${policy.signals.country}`, outcome: policy.decision === 'block' ? 'blocked' : 'success', riskScore: policy.riskScore });
-    addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_SUCCESS', details: `Login from ${device.browser} on ${device.os}`, ip: ip.ip, location: `${policy.signals.city}, ${policy.signals.country}`, outcome: 'success', riskScore: policy.riskScore });
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'OTP_VERIFIED', details: `OTP verified via ${otp.channel}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success', riskScore: policy.riskScore });
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'ZERO_TRUST_CHECK', details: `Signals: IP=${ip.ip}, ISP=${ip.isp}, Device=${device.approved ? 'Trusted' : 'Untrusted'}, Posture: OS=${device.posture.hasUpdatedOS}, AV=${device.posture.hasAV}, Encrypted=${device.posture.diskEncrypted}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success', riskScore: policy.riskScore });
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'POLICY_DECISION', details: `Decision: ${policy.decision.toUpperCase()} | Risk: ${policy.riskScore}/100 | ${policy.reasons.join('; ') || 'No risk factors'}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: policy.decision === 'block' ? 'blocked' : 'success', riskScore: policy.riskScore });
+
+    if (policy.decision === 'block') {
+      addAuditLog({ userId: user.id, userEmail: user.email, action: 'ACCESS_BLOCKED', details: `Access denied: ${policy.reasons.join(', ')}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'blocked', riskScore: policy.riskScore });
+      localStorage.setItem('zt_blocked', JSON.stringify({ reasons: policy.reasons, riskScore: policy.riskScore, signals: policy.signals }));
+      setState(s => ({ ...s, pendingOTP: null, lastPolicyResult: policy }));
+      return { success: true, error: 'ACCESS_BLOCKED' };
+    }
+
+    addAuditLog({ userId: user.id, userEmail: user.email, action: 'LOGIN_SUCCESS', details: `Login from ${device.browser}/${device.os} | JWT issued`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success', riskScore: policy.riskScore });
 
     localStorage.setItem('zt_session', JSON.stringify({ userId: user.id, lastPolicy: policy }));
     setState(s => ({ ...s, user, isAuthenticated: true, pendingOTP: null, lastPolicyResult: policy, currentDevice: device }));
@@ -198,11 +222,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const resendOTP = useCallback(() => {
     if (!state.pendingOTP) return { success: false };
     const otps = getOTPs();
+    const existing = otps.find(o => o.userId === state.pendingOTP!.userId && o.type === state.pendingOTP!.type);
+    const channel = existing?.channel || 'email';
     const filtered = otps.filter(o => !(o.userId === state.pendingOTP!.userId && o.type === state.pendingOTP!.type));
     const otp = generateOTP();
-    filtered.push({ userId: state.pendingOTP.userId, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: state.pendingOTP.type, attempts: 0 });
+    filtered.push({ userId: state.pendingOTP.userId, code: otp, expiresAt: Date.now() + 5 * 60 * 1000, type: state.pendingOTP.type, channel, attempts: 0 });
     setOTPs(filtered);
-    console.log(`📧 Resent OTP: ${otp}`);
+    console.log(`📧 Resent OTP (${channel}): ${otp}`);
     return { success: true, otp };
   }, [state.pendingOTP, generateOTP]);
 
@@ -226,82 +252,48 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const addUser = useCallback((data: { fullName: string; email: string; mobile: string; password: string; role: Role }) => {
     const users = getUsers();
     if (users.find(u => u.email === data.email)) return { success: false, error: 'Email already exists' };
-    const newUser: DemoUser = {
-      id: 'u_' + Date.now(),
-      fullName: data.fullName,
-      email: data.email,
-      mobile: data.mobile,
-      password: data.password,
-      role: data.role,
-      status: 'active',
-      createdAt: new Date().toISOString(),
-    };
-    users.push(newUser);
+    users.push({ id: 'u_' + Date.now(), ...data, status: 'active', createdAt: new Date().toISOString(), failedLoginAttempts: 0 });
     setUsers(users);
     const ip = getIP();
-    addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_CREATED', details: `SuperAdmin created user: ${data.email} with role ${data.role}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_CREATED', details: `Created user: ${data.email} [${data.role}]`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
     return { success: true };
   }, [state.user, getIP]);
 
   const updateUser = useCallback((userId: string, data: Partial<Pick<DemoUser, 'fullName' | 'email' | 'mobile' | 'role' | 'status'>>) => {
     const users = getUsers();
     const user = users.find(u => u.id === userId);
-    if (user) {
-      Object.assign(user, data);
-      setUsers(users);
-      const ip = getIP();
-      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_UPDATED', details: `SuperAdmin updated user: ${user.email}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
-    }
+    if (user) { Object.assign(user, data); setUsers(users); const ip = getIP(); addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_UPDATED', details: `Updated user: ${user.email}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' }); }
   }, [state.user, getIP]);
-  
+
   const updateUserRole = useCallback((userId: string, role: Role) => {
-    const users = getUsers();
-    const user = users.find(u => u.id === userId);
-    if (user) {
-      user.role = role;
-      setUsers(users);
-      const ip = getIP();
-      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'ROLE_CHANGED', details: `Role changed for ${user.email} to ${role}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
-    }
+    const users = getUsers(); const user = users.find(u => u.id === userId);
+    if (user) { user.role = role; setUsers(users); const ip = getIP(); addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'ROLE_CHANGED', details: `${user.email} → ${role}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' }); }
   }, [state.user, getIP]);
 
   const toggleUserStatus = useCallback((userId: string) => {
-    const users = getUsers();
-    const user = users.find(u => u.id === userId);
-    if (user) {
-      user.status = user.status === 'active' ? 'disabled' : 'active';
-      setUsers(users);
-      const ip = getIP();
-      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_STATUS_CHANGED', details: `User ${user.email} ${user.status}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
-    }
+    const users = getUsers(); const user = users.find(u => u.id === userId);
+    if (user) { user.status = user.status === 'active' ? 'disabled' : 'active'; setUsers(users); const ip = getIP(); addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_STATUS_CHANGED', details: `${user.email} → ${user.status}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' }); }
+  }, [state.user, getIP]);
+
+  const unlockUser = useCallback((userId: string) => {
+    const users = getUsers(); const user = users.find(u => u.id === userId);
+    if (user) { user.status = 'active'; user.failedLoginAttempts = 0; user.lockedUntil = undefined; setUsers(users); const ip = getIP(); addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_UNLOCKED', details: `${user.email} unlocked by admin`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' }); }
   }, [state.user, getIP]);
 
   const deleteUser = useCallback((userId: string) => {
-    const users = getUsers();
-    const target = users.find(u => u.id === userId);
-    const filtered = users.filter(u => u.id !== userId);
-    setUsers(filtered);
-    const ip = getIP();
-    addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_DELETED', details: `SuperAdmin deleted user: ${target?.email || userId}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    const users = getUsers(); const target = users.find(u => u.id === userId);
+    setUsers(users.filter(u => u.id !== userId));
+    const ip = getIP(); addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'USER_DELETED', details: `Deleted: ${target?.email || userId}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
   }, [state.user, getIP]);
 
   const approveDevice = useCallback((deviceId: string) => {
-    const devices = getDevices();
-    const device = devices.find(d => d.id === deviceId);
-    if (device) {
-      device.approved = true;
-      device.approvedBy = state.user?.id;
-      setDevices(devices);
-      const ip = getIP();
-      addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'DEVICE_APPROVED', details: `Device ${deviceId} approved`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
-    }
+    const devices = getDevices(); const device = devices.find(d => d.id === deviceId);
+    if (device) { device.approved = true; device.approvedBy = state.user?.id; setDevices(devices); const ip = getIP(); addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'DEVICE_APPROVED', details: `Device ${deviceId} approved`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' }); }
   }, [state.user, getIP]);
 
   const denyDevice = useCallback((deviceId: string) => {
-    const devices = getDevices().filter(d => d.id !== deviceId);
-    setDevices(devices);
-    const ip = getIP();
-    addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'DEVICE_DENIED', details: `Device ${deviceId} denied and removed`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    setDevices(getDevices().filter(d => d.id !== deviceId));
+    const ip = getIP(); addAuditLog({ userId: state.user?.id || '', userEmail: state.user?.email || '', action: 'DEVICE_DENIED', details: `Device ${deviceId} removed`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
   }, [state.user, getIP]);
 
   const getAllDevices = useCallback(() => getDevices(), []);
@@ -309,14 +301,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const requestDeviceApproval = useCallback(() => {
     if (!state.user || !state.currentDevice) return;
     const ip = getIP();
-    addAuditLog({ userId: state.user.id, userEmail: state.user.email, action: 'DEVICE_APPROVAL_REQUEST', details: `Device approval requested: ${state.currentDevice.browser} on ${state.currentDevice.os}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
+    addAuditLog({ userId: state.user.id, userEmail: state.user.email, action: 'DEVICE_APPROVAL_REQUEST', details: `${state.currentDevice.browser}/${state.currentDevice.os}`, ip: ip.ip, location: `${ip.city}, ${ip.country}`, outcome: 'success' });
   }, [state.user, state.currentDevice, getIP]);
 
   return (
     <AuthContext.Provider value={{
-      ...state, register, login, verifyOTP, resendOTP, logout, hasRole,
+      ...state, register, login, sendLoginOTP, verifyOTP, resendOTP, logout, hasRole,
       getAllUsers, addUser, updateUser, updateUserRole, toggleUserStatus, deleteUser,
-      approveDevice, denyDevice, getAllDevices, requestDeviceApproval,
+      approveDevice, denyDevice, getAllDevices, requestDeviceApproval, unlockUser,
     }}>
       {children}
     </AuthContext.Provider>
