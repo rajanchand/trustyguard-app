@@ -13,6 +13,7 @@ import Dashboard from "./pages/Dashboard";
 import Admin from "./pages/Admin";
 import SuperAdmin from "./pages/SuperAdmin";
 import ITDashboard from "./pages/ITDashboard";
+import AccessDenied from "./pages/AccessDenied";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -29,6 +30,7 @@ const App = () => (
             <Route path="/login" element={<Login />} />
             <Route path="/register" element={<Register />} />
             <Route path="/verify-otp" element={<VerifyOTP />} />
+            <Route path="/access-denied" element={<AccessDenied />} />
             <Route path="/dashboard" element={<ProtectedRoute roles={['USER','ADMIN','SUPERADMIN','IT']}><Dashboard /></ProtectedRoute>} />
             <Route path="/admin" element={<ProtectedRoute roles={['ADMIN','SUPERADMIN']}><Admin /></ProtectedRoute>} />
             <Route path="/superadmin" element={<ProtectedRoute roles={['SUPERADMIN']}><SuperAdmin /></ProtectedRoute>} />
