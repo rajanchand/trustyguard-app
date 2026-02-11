@@ -48,18 +48,18 @@ let cachedIPInfo: RealIPInfo | null = null;
 export async function fetchRealIP(): Promise<RealIPInfo> {
   if (cachedIPInfo) return cachedIPInfo;
   try {
-    const res = await fetch('http://ip-api.com/json/?fields=query,country,city,regionName,isp,timezone,lat,lon');
+    const res = await fetch('https://ipapi.co/json/');
     if (!res.ok) throw new Error('IP API failed');
     const data = await res.json();
     cachedIPInfo = {
-      ip: data.query || '0.0.0.0',
-      country: data.country || 'Unknown',
+      ip: data.ip || '0.0.0.0',
+      country: data.country_name || data.country || 'Unknown',
       city: data.city || 'Unknown',
-      region: data.regionName || '',
-      isp: data.isp || 'Unknown',
+      region: data.region || '',
+      isp: data.org || 'Unknown',
       timezone: data.timezone || '',
-      lat: data.lat || 0,
-      lon: data.lon || 0,
+      lat: data.latitude || 0,
+      lon: data.longitude || 0,
     };
     return cachedIPInfo;
   } catch {
